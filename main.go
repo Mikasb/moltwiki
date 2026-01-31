@@ -23,6 +23,9 @@ import (
 //go:embed templates/*.html
 var templateFS embed.FS
 
+//go:embed skill.md
+var skillMD []byte
+
 var db *sql.DB
 
 type Project struct {
@@ -152,6 +155,7 @@ func main() {
 	mux.HandleFunc("/project/", handleProject)
 	mux.HandleFunc("/submit", handleSubmit)
 	mux.HandleFunc("/search", handleSearch)
+	mux.HandleFunc("/skill.md", handleSkillMD)
 
 	// API routes
 	mux.HandleFunc("/api/v1/agents/register", corsWrap(handleAPIRegister))
@@ -532,6 +536,11 @@ func handleProject(w http.ResponseWriter, r *http.Request) {
 		"Project":  p,
 		"Comments": comments,
 	})
+}
+
+func handleSkillMD(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.Write(skillMD)
 }
 
 func handleSubmit(w http.ResponseWriter, r *http.Request) {
