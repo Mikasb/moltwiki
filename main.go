@@ -15,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -27,6 +28,114 @@ var templateFS embed.FS
 var skillMD []byte
 
 var db *sql.DB
+
+// --- Request Tracking ---
+type RequestTracker struct {
+	mu         sync.Mutex
+	total      int64
+	today      int64
+	hourly     int64
+	lastHour   time.Time
+	lastDay    time.Time
+	endpoints  map[string]int64
+	recentIPs  map[string]bool
+	uniqueToday int64
+}
+
+var tracker = &RequestTracker{
+	lastHour:  time.Now().Truncate(time.Hour),
+	lastDay:   time.Now().Truncate(24 * time.Hour),
+	endpoints: make(map[string]int64),
+	recentIPs: make(map[string]bool),
+}
+
+func (t *RequestTracker) Track(r *http.Request) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := time.Now()
+
+	// Reset hourly counter
+	thisHour := now.Truncate(time.Hour)
+	if thisHour.After(t.lastHour) {
+		t.hourly = 0
+		t.lastHour = thisHour
+	}
+
+	// Reset daily counter
+	thisDay := now.Truncate(24 * time.Hour)
+	if thisDay.After(t.lastDay) {
+		t.today = 0
+		t.uniqueToday = 0
+		t.recentIPs = make(map[string]bool)
+		t.lastDay = thisDay
+	}
+
+	t.total++
+	t.today++
+	t.hourly++
+
+	// Track endpoint
+	path := r.URL.Path
+	if strings.HasPrefix(path, "/api/") {
+		// Normalize API paths
+		parts := strings.Split(path, "/")
+		if len(parts) > 4 {
+			// /api/v1/projects/123/vote -> /api/v1/projects/*/vote
+			for i, p := range parts {
+				if _, err := strconv.Atoi(p); err == nil {
+					parts[i] = "*"
+				}
+			}
+			path = strings.Join(parts, "/")
+		}
+	}
+	t.endpoints[path]++
+
+	// Track unique IPs
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip == "" {
+		ip = r.RemoteAddr
+	}
+	if !t.recentIPs[ip] {
+		t.recentIPs[ip] = true
+		t.uniqueToday++
+	}
+}
+
+func (t *RequestTracker) Stats() map[string]interface{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Top endpoints
+	type ep struct {
+		Path  string `json:"path"`
+		Count int64  `json:"count"`
+	}
+	var topEndpoints []ep
+	for p, c := range t.endpoints {
+		topEndpoints = append(topEndpoints, ep{p, c})
+	}
+	// Simple sort (top 10)
+	for i := 0; i < len(topEndpoints); i++ {
+		for j := i + 1; j < len(topEndpoints); j++ {
+			if topEndpoints[j].Count > topEndpoints[i].Count {
+				topEndpoints[i], topEndpoints[j] = topEndpoints[j], topEndpoints[i]
+			}
+		}
+	}
+	if len(topEndpoints) > 10 {
+		topEndpoints = topEndpoints[:10]
+	}
+
+	return map[string]interface{}{
+		"requests_total":    t.total,
+		"requests_today":    t.today,
+		"requests_this_hour": t.hourly,
+		"unique_visitors_today": t.uniqueToday,
+		"top_endpoints":     topEndpoints,
+	}
+}
 
 type Project struct {
 	ID           int       `json:"id"`
@@ -163,13 +272,20 @@ func main() {
 	mux.HandleFunc("/api/v1/projects", corsWrap(handleAPIProjects))
 	mux.HandleFunc("/api/v1/projects/", corsWrap(handleAPIProjectRoute))
 	mux.HandleFunc("/api/v1/search", corsWrap(handleAPISearch))
+	mux.HandleFunc("/api/v1/traffic", corsWrap(handleAPITraffic))
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
+	// Wrap mux with request tracking
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tracker.Track(r)
+		mux.ServeHTTP(w, r)
+	})
+
 	log.Printf("🦞 MoltWiki running on http://localhost:%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Fatal(http.ListenAndServe(":"+port, handler))
 }
 
 func corsWrap(handler http.HandlerFunc) http.HandlerFunc {
@@ -866,6 +982,23 @@ func handleAPIComments(w http.ResponseWriter, r *http.Request, projectID int) {
 	default:
 		jsonErr(w, 405, "method not allowed")
 	}
+}
+
+func handleAPITraffic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		jsonErr(w, 405, "method not allowed")
+		return
+	}
+	stats := tracker.Stats()
+	// Add app stats
+	appStats := getStats()
+	stats["projects"] = appStats.TotalProjects
+	stats["agents"] = appStats.TotalAgents
+	stats["votes"] = appStats.TotalVotes
+	var commentCount int
+	db.QueryRow("SELECT COUNT(*) FROM comments").Scan(&commentCount)
+	stats["comments"] = commentCount
+	jsonResp(w, 200, stats)
 }
 
 func handleAPISearch(w http.ResponseWriter, r *http.Request) {
