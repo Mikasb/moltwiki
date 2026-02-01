@@ -816,6 +816,10 @@ func handleAPIProjectRoute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(parts) == 1 {
+		if r.Method == "PATCH" {
+			handleAPIProjectUpdate(w, r, id)
+			return
+		}
 		if r.Method != "GET" {
 			jsonErr(w, 405, "method not allowed")
 			return
@@ -840,6 +844,43 @@ func handleAPIProjectRoute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonErr(w, 404, "not found")
+}
+
+func handleAPIProjectUpdate(w http.ResponseWriter, r *http.Request, projectID int) {
+	adminKey := os.Getenv("ADMIN_KEY")
+	if adminKey == "" {
+		jsonErr(w, 403, "admin endpoint not configured")
+		return
+	}
+	auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if auth != adminKey {
+		jsonErr(w, 403, "forbidden")
+		return
+	}
+	var req struct {
+		Description *string `json:"description"`
+		Name        *string `json:"name"`
+		URL         *string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonErr(w, 400, "invalid json")
+		return
+	}
+	if req.Description != nil {
+		db.Exec("UPDATE projects SET description = ? WHERE id = ?", *req.Description, projectID)
+	}
+	if req.Name != nil {
+		db.Exec("UPDATE projects SET name = ? WHERE id = ?", *req.Name, projectID)
+	}
+	if req.URL != nil {
+		db.Exec("UPDATE projects SET url = ? WHERE id = ?", *req.URL, projectID)
+	}
+	p, err := getProject(projectID)
+	if err != nil {
+		jsonErr(w, 404, "project not found")
+		return
+	}
+	jsonResp(w, 200, p)
 }
 
 func handleAPIVote(w http.ResponseWriter, r *http.Request, projectID int) {
